@@ -1,76 +1,115 @@
-import os
-import joblib
 import pandas as pd
+import numpy as np
 from xgboost import XGBClassifier
-from sklearn.metrics import classification_report, roc_auc_score, confusion_matrix
+from sklearn.metrics import classification_report, roc_auc_score
+import joblib
+import os
 
+print("🚀 Starting Precision-Calibrated XGBoost Multi-Class Training Pipeline...")
 
-def train_and_verify_model():
-    print("Initializing Model Training & Verification Pipeline...")
+# =========================================================================
+# 1. LOAD PRE-SPLIT DATA
+# =========================================================================
+processed_path = "data_processed/"
+train_file = os.path.join(processed_path, "train_data.pkl")
+test_file  = os.path.join(processed_path, "test_data.pkl")
 
-    # 1. Load Preprocessed Data Splits
-    data_dir = "dataset"
-    try:
-        X_train = pd.read_csv(os.path.join(data_dir, "X_train.csv"))
-        X_test = pd.read_csv(os.path.join(data_dir, "X_test.csv"))
-        y_train = pd.read_csv(os.path.join(data_dir, "y_train.csv")).values.ravel()
-        y_test = pd.read_csv(os.path.join(data_dir, "y_test.csv")).values.ravel()
-    except FileNotFoundError as e:
-        raise FileNotFoundError("Processed files missing. Execute src/preprocess.py first.") from e
+if not os.path.exists(train_file) or not os.path.exists(test_file):
+    raise FileNotFoundError("Missing split files. Run 'python src/preprocess.py' first.")
 
-    # 2. Configure XGBoost to handle class imbalance
-    # scale_pos_weight balances the weight of the rare failure classes
-    negative_instances = len(y_train) - sum(y_train)
-    positive_instances = sum(y_train)
-    imbalance_ratio = negative_instances / positive_instances
+print("Loading SMOTE-balanced training matrix...")
+train_df = pd.read_pickle(train_file)
+test_df  = pd.read_pickle(test_file)
 
-    print(f"Dataset imbalance ratio calculated: 1:{imbalance_ratio:.2f}")
+X_train = train_df.drop(columns=["target"])
+y_train = train_df["target"].astype(np.uint8)
 
-    # 3. Initialize Model
-    model = XGBClassifier(
-        n_estimators=100,
-        max_depth=5,
-        learning_rate=0.1,
-        scale_pos_weight=imbalance_ratio,  # Crucial for highly accurate minority class capture
-        random_state=42,
-        eval_metric="logloss"
-    )
+X_test = test_df.drop(columns=["target"])
+y_test = test_df["target"].astype(np.uint8)
 
-    # 4. Train the Model
-    print("Fitting XGBoost Classifier on scaled training matrices...")
-    model.fit(X_train, y_train)
+print(f"Training on {len(X_train):,} rows (SMOTE-augmented)")
+print(f"Evaluating on {len(X_test):,} rows (real sensor data only)\n")
 
-    # 5. Predict on Unseen Test Data to Verify Accuracy
-    print("Executing predictive inference on verification subset...")
-    y_pred = model.predict(X_test)
-    y_proba = model.predict_proba(X_test)[:, 1]
+# =========================================================================
+# 2. ENFORCE CATEGORICAL DTYPE AFTER PICKLE RELOAD
+# =========================================================================
+# Pickle does not always preserve pandas category dtype for string columns.
+# We explicitly re-cast any object/string columns in both splits, then align
+# their category levels so XGBoost sees a consistent encoding.
+CATEGORICAL_COLS = ["model"]
 
-    # 6. Generate Verification Report
-    print("\n" + "=" * 50)
-    print("         ENTERPRISE ENGINE VERIFICATION REPORT")
-    print("=" * 50)
+for col in CATEGORICAL_COLS:
+    if col in X_train.columns:
+        X_train[col] = X_train[col].astype(str).astype("category")
+        X_test[col]  = X_test[col].astype(str).astype("category")
 
-    # Print classic precision, recall, f1 metrics
-    print(classification_report(y_test, y_pred, target_names=["Normal", "Failure"]))
+        # Align category levels: test must know all categories seen in train
+        combined_cats = X_train[col].cat.categories.union(X_test[col].cat.categories)
+        X_train[col] = X_train[col].cat.set_categories(combined_cats)
+        X_test[col]  = X_test[col].cat.set_categories(combined_cats)
 
-    # Print area under curve
-    auc = roc_auc_score(y_test, y_proba)
-    print(f"ROC-AUC Performance Metric: {auc:.4f}")
+print(f"Categorical columns aligned: {CATEGORICAL_COLS}")
+# SMOTE converts numeric columns to object dtype — cast them all back
+for col in X_train.columns:
+    if col not in CATEGORICAL_COLS:
+        X_train[col] = pd.to_numeric(X_train[col], errors="coerce")
+        X_test[col]  = pd.to_numeric(X_test[col],  errors="coerce")
 
-    # Print Raw Confusion Matrix
-    cm = confusion_matrix(y_test, y_pred)
-    print("\nConfusion Matrix Array Breakdown:")
-    print(f"  True Normals (Correctly Predicted Safe):  {cm[0][0]}")
-    print(f"  False Alarms (Wrongly Flapped Alarm):     {cm[0][1]}")
-    print(f"  Missed Breakdowns (Catastrophic Escapes): {cm[1][0]}")
-    print(f"  True Failures (Correctly Caught Breaks):  {cm[1][1]}")
-    print("=" * 50)
+# =========================================================================
+# 3. TRAIN XGBOOST
+# =========================================================================
+print("Configuring regularized Multi-Class XGBoost engine...")
+model = XGBClassifier(
+    n_estimators=300,
+    max_depth=5,
+    learning_rate=0.05,
+    reg_alpha=1.0,
+    reg_lambda=3.0,
+    objective="multi:softprob",
+    num_class=5,
+    random_state=42,
+    eval_metric="mlogloss",
+    enable_categorical=True,
+    tree_method="hist",
+    n_jobs=-1
+)
 
-    # 7. Serialize trained model artifact
-    model_output_path = os.path.join(data_dir, "predictive_model.pkl")
-    joblib.dump(model, model_output_path)
-    print(f"\nModel verified and successfully serialized to: {model_output_path}")
+print("Fitting model on SMOTE-augmented training data...")
+model.fit(X_train, y_train)
 
+# =========================================================================
+# 4. EVALUATE ON REAL HELD-OUT DATA
+# =========================================================================
+print("Evaluating on real (non-synthetic) test set...\n")
+y_pred  = model.predict(X_test)
+y_proba = model.predict_proba(X_test)
 
-if __name__ == "__main__":
-    train_and_verify_model()
+target_names = [
+    "Nominal Operational State",
+    "Component 1 Failure",
+    "Component 2 Failure",
+    "Component 3 Failure",
+    "Component 4 Failure"
+]
+
+print("=" * 55)
+print("   VERIFICATION REPORT (REAL DATA ONLY — NO SMOTE)")
+print("=" * 55)
+print(classification_report(y_test, y_pred, target_names=target_names, zero_division=0))
+
+try:
+    auc = roc_auc_score(y_test, y_proba, multi_class="ovr", average="macro")
+    print(f"Macro ROC-AUC (OvR): {auc:.4f}")
+except Exception as e:
+    print(f"ROC-AUC skipped: {e}")
+
+print("=" * 55)
+
+# =========================================================================
+# 5. SAVE ARTIFACTS
+# =========================================================================
+os.makedirs("model", exist_ok=True)
+joblib.dump(model, "model/xgb_multi_model.pkl")
+joblib.dump(list(X_train.columns), "model/feature_columns.pkl")
+print("\n✅ Model artifacts saved to /model/")
+print("   Run 'uvicorn src.main:app --reload' to start the API.")
