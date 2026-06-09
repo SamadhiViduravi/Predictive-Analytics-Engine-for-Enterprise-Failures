@@ -2,4 +2,5 @@
 dataset/industrial_telemetry.csv 
 dataset/X_*.csv 
 dataset/y_*.csv 
-dataset/*.pkl 
+dataset/*.pkl
+*.csv
