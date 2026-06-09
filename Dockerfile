@@ -1,5 +1,5 @@
 # =========================================================================
-# 1. USE AN OFFICIAL LIGHTWEIGHT PYTHON BASE IMAGE
+# 1. USE LIGHTWEIGHT BASE IMAGE & SET UP SECURITY ENVIRONMENT
 # =========================================================================
 FROM python:3.10-slim
 
@@ -7,36 +7,35 @@ FROM python:3.10-slim
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# =========================================================================
-# 2. SET UP THE WORKING DIRECTORY INSIDE THE CONTAINER
-# =========================================================================
+# Create a secure, unprivileged user matching Hugging Face constraints
+RUN useradd -m -u 1000 user
+USER user
+ENV PATH="/home/user/.local/bin:$PATH"
+
+# Set up the secure working directory inside the user's home space
 WORKDIR /app
 
-# Install system utilities needed for compiling certain dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    && rm -rf /var/lib/apt/lists/*
-
 # =========================================================================
-# 3. CACHE DEPENDENCIES LAYERS FOR FASTER BUILD SPEEDS
+# 2. RUNTIME DEPENDENCY COMPILATION
 # =========================================================================
-COPY requirements.txt /app/
+# Copy dependency manifest matching the explicit user ownership permissions
+COPY --chown=user requirements.txt /app/requirements.txt
 
-# Install dependencies directly into the system container (no virtualenv needed inside Docker)
+# Install packages safely into the local user space profile
 RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r requirements.txt
+    && pip install --no-cache-dir --user -r requirements.txt
 
 # =========================================================================
-# 4. COPY COMPREHENSIVE PROJECT ARTIFACTS
+# 3. CODE ARTIFACT DEPLOYMENT
 # =========================================================================
-COPY ./src /app/src
-COPY ./model /app/model
+# Copy the source engine arrays and optimized model binaries cleanly
+COPY --chown=user ./src /app/src
+COPY --chown=user ./model /app/model
 
-# 🌟 FIX: Expose port 7860 for Hugging Face Spaces compatibility
+# Expose the mandatory Hugging Face web application service port
 EXPOSE 7860
 
 # =========================================================================
-# 5. EXECUTE PRODUCTION API SERVICE VIA UVICORN
+# 4. EXECUTE MICROSERVICE ROUTER via UVICORN ENGINE
 # =========================================================================
-# 🌟 FIX: Map the Uvicorn engine directly to serve traffic over port 7860
 CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "7860"]
